@@ -7963,8 +7963,8 @@ button.downloadSubtitle:disabled {
 			let credentials = {}, captcha = {};
 			for (let i = 0; i < localStorage.length; i++) {
 				if (/^credentials_/.test(localStorage.key(i))) {
+					// 注：原来这里有一句 base.setStorage("")，会写入 key 为 ""、值为 "undefined" 的垃圾项且不清除凭据，已移除
 					credentials = base.getStorage(localStorage.key(i));
-					base.setStorage("");
 				}
 				if (/^captcha_[\w]{16}/.test(localStorage.key(i))) {
 					captcha = base.getStorage(localStorage.key(i));
@@ -7984,19 +7984,21 @@ button.downloadSubtitle:disabled {
 			const shareId = url.pathname.match?.(/\/s\/([^/?#]+)/)?.[1] || null;
 			const urlCode = url.searchParams.get('code');
 
-			let code = urlCode;
+		let code = urlCode;
+		if (urlCode) { this.getShareToken.code = urlCode; this.getShareToken.shareId = shareId; }
 
-			if (!urlCode) {
-				if (!code && this.getShareToken.code) {
-					code = this.getShareToken.code;
-				}
+		if (!urlCode) {
+			// 缓存的提取码按 shareId 区分，避免切换分享链接后误用上一次分享的旧提取码
+			if (!code && this.getShareToken.code && this.getShareToken.shareId === shareId) {
+				code = this.getShareToken.code;
+			}
 				if (!code && isWaitForType) {
 					base.waitForKeyElements(`input.ant-input[type=text]`, (element) => {
 						if (element.data('code-listener-bound')) return;
 						element.data('code-listener-bound', true);
 						element.on('input', (e) => {
 							const val = e.target.value.trim();
-							if (val) this.getShareToken.code = val;
+							if (val) { this.getShareToken.code = val; this.getShareToken.shareId = shareId; }
 						});
 					});
 					return;
@@ -8119,20 +8121,175 @@ button.downloadSubtitle:disabled {
 			base.showMainDialog(config.base.dom.method[temp.mode].title, download.generateDOM(), config.base.dom.method[temp.mode].footer);
 		},
 		getSelectedList() {
+			// v2 兼容版勾选识别（光鸭前端改版后，含误下载防护与失败诊断）：
+			// 步骤0：只在文件列表容器内采集"已勾选行"，一个都没勾直接返回 []（防误下载 + 免全量扫描）
+			// 路径A：从勾选行元素向上回溯 fiber（Object.keys 只扫自有属性），提取行数据对象
+			// 路径B：从列表根向上回溯 fiber，找「文件对象数组 + 勾选 id 数组」，长度≤勾选数的集合优先
+			// 路径C：全局 fiber 扫描，先聚合文件对象池/ id 池，再按三级顺序求交集
+			// 全部落空时输出结构化诊断，不再静默返回
 			try {
-				const selectedList = [];
-				const reactDom = document.querySelector(`.swangpan-file-list__root[data-ui="file-list"]`);
-				const reactObj = base.findReact(reactDom);
-				const props = reactObj.pendingProps;
-				if (props) {
-					const fileList = props.dataSource || [];
-					const selectedKeys = props.selectedItems || [];
-					fileList.forEach(val => {
-						if (selectedKeys.includes(val.fileId)) selectedList.push({ ...val });
-					});
+				const idOf = o => o?.fileId ?? o?.id ?? o?.resourceId;
+				const isFile = o => !!o && typeof o === "object" && !Array.isArray(o) &&
+					("fileId" in o || "id" in o || "resourceId" in o) &&
+					("fileName" in o || "name" in o);
+				const list = [];
+				const seen = new Set();
+				const pushItem = item => {
+					const id = idOf(item);
+					if (id == null || seen.has(String(id))) return false;
+					seen.add(String(id));
+					list.push({ ...item, fileId: id, fileName: item.fileName ?? item.name });
+					return true;
+				};
+				const fiberKey = el => {
+					try {
+						const k = Object.keys(el).find(k => /^__reactFiber\$|^__reactInternalInstance\$/.test(k));
+						if (k) return k;
+					} catch { }
+					// 注意：String(symbol) 形如 "Symbol(__reactFiber$x)"，带前缀会被正则拒绝，必须用 description
+					const sym = (Object.getOwnPropertySymbols ? Object.getOwnPropertySymbols(el) : []).find(s => /^__reactFiber\$|^__reactInternalInstance\$/.test(typeof s.description === "string" ? s.description : ""));
+					return sym || null;
+				};
+				const propsOf = f => (f?.stateNode && f.stateNode.props) || f?.memoizedProps || f?.pendingProps;
+				const asArr = v => v instanceof Set ? [...v] : Array.isArray(v) ? v : null;
+
+				// —— 步骤0：DOM 采集已勾选行（限定列表容器，排除左侧目录树）——
+				const listBox = document.querySelector(`.swangpan-file-list__root[data-ui="file-list"], .swangpan-file-list__root, [data-ui="file-list"], [class*="file-list__root"], [class*="file-list"]`) || document;
+				const uniqRows = [...new Set([...listBox.querySelectorAll(
+					`input[type="checkbox"]:checked, [role="checkbox"][aria-checked="true"], [aria-selected="true"]`)]
+					.map(el => el.closest(`[class*="item"], [class*="row"], tr, li`) || el)
+					.filter(Boolean))];
+				const checkedCount = uniqRows.length;
+				if (!checkedCount) return [];
+
+				// 行上的稳定 id（虚拟列表常用 data-row-key / data-file-id），供路径C 校验
+				const rowIds = new Set();
+				uniqRows.forEach(row => {
+					const v = row.getAttribute?.("data-row-key") ?? row.getAttribute?.("data-file-id") ?? row.getAttribute?.("data-id");
+					if (v) rowIds.add(String(v));
+				});
+
+				// —— 路径A：勾选行 fiber 上溯提取行数据（每行只收 1 个对象，防嵌套文件误收）——
+				for (const row of uniqRows) {
+					const key = fiberKey(row);
+					if (!key) continue;
+					const before = list.length;
+					let fiber = row[key], found = false;
+					for (let d = 0; fiber && d < 20 && !found; d++, fiber = fiber.return) {
+						const props = propsOf(fiber);
+						if (!props || typeof props !== "object") continue;
+						for (const k of Object.keys(props)) {
+							let v; try { v = props[k]; } catch { continue; }
+							if (isFile(v)) { if (pushItem(v)) found = true; }
+						}
+					}
+					if (list.length > before + 1) list.splice(before + 1, list.length - before - 1);
 				}
-				return selectedList;
-			} catch {
+				// 命中数≈勾选行数即返回（容错：全选表头的勾选框可能多算一行）
+				if (list.length && list.length >= checkedCount - 1) {
+					console.info("[下载助手] 光鸭 getSelectedList 命中路径A");
+					return list;
+				}
+
+				// —— 路径B：列表根 fiber 上溯，找「文件数组 + 勾选 id 数组」（以本路径新增数判定，不被路径A 残留干扰）——
+				const beforeB = list.length;
+				const roots = listBox.querySelectorAll(`.swangpan-file-list__root[data-ui="file-list"], .swangpan-file-list__root, [data-ui="file-list"], [class*="file-list__root"]`);
+				for (const root of (roots.length ? roots : [listBox])) {
+					const key = fiberKey(root);
+					if (!key) continue;
+					let fiber = root[key];
+					for (let d = 0; fiber && d < 40 && list.length === beforeB; d++, fiber = fiber.return) {
+						const props = propsOf(fiber);
+						if (!props || typeof props !== "object") continue;
+						let dataArr = null;
+						const selCands = [];
+						for (const k of Object.keys(props)) {
+							let v; try { v = props[k]; } catch { continue; }
+							if (!dataArr && Array.isArray(v) && v.length && v.every(isFile)) { dataArr = v; continue; }
+							if (/select|checked/i.test(k)) {
+								const arr = asArr(v);
+								if (arr && arr.length && arr.every(x => typeof x === "string" || typeof x === "number" || (x && typeof x === "object" && idOf(x) != null))) selCands.push(arr);
+							}
+						}
+						if (!dataArr || !selCands.length) continue;
+						// 长度不超过勾选行数的勾选集合优先采信（全选表头可能多 1）
+						selCands.sort((a, b) => (a.length <= checkedCount + 1 ? 0 : 1) - (b.length <= checkedCount + 1 ? 0 : 1));
+						const selIds = new Set(selCands[0].map(x => String(x && typeof x === "object" ? idOf(x) : x)));
+						dataArr.forEach(item => { if (selIds.has(String(idOf(item)))) pushItem(item); });
+					}
+					if (list.length > beforeB) { console.info("[下载助手] 光鸭 getSelectedList 命中路径B"); return list; }
+				}
+
+				// —— 路径C：全局 fiber 扫描，先聚合后合并，降低误判 ——
+				let anyEl = null;
+				for (const el of document.querySelectorAll(`#root *, [class*="file-list"] *`)) {
+					if (fiberKey(el)) { anyEl = el; break; }
+				}
+				let steps = 0;
+				const dataPools = [];
+				const idPools = [];
+				if (anyEl) {
+					let rootFiber = anyEl[fiberKey(anyEl)];
+					while (rootFiber.return) rootFiber = rootFiber.return;
+					const arraysOf = node => {
+						const out = [];
+						const props = propsOf(node);
+						if (props && typeof props === "object") for (const k of Object.keys(props)) {
+							try { const v = props[k]; if (Array.isArray(v) || v instanceof Set) out.push(v); } catch { }
+						}
+						let h = node.memoizedState;
+						for (let i = 0; h && i < 40; i++, h = h.next) {
+							const ms = h.memoizedState;
+							if (Array.isArray(ms) || ms instanceof Set) out.push(ms);
+							else if (ms && typeof ms === "object") {
+								for (const k of Object.keys(ms)) { try { const v = ms[k]; if (Array.isArray(v) || v instanceof Set) out.push(v); } catch { } }
+							}
+						}
+						return out;
+					};
+					const stack = [rootFiber];
+					while (stack.length && steps++ < 20000 && (dataPools.length < 60 || idPools.length < 60)) {
+						const node = stack.pop();
+						if (!node) continue;
+						if (node.child) stack.push(node.child);
+						if (node.sibling) stack.push(node.sibling);
+						for (const raw of arraysOf(node)) {
+							const a = asArr(raw);
+							if (!a || !a.length) continue;
+							if (a.every(isFile)) { if (dataPools.length < 60 && !dataPools.includes(a)) dataPools.push(a); }
+							else if (a.every(x => typeof x === "string" || typeof x === "number")) { if (idPools.length < 60 && !idPools.includes(a)) idPools.push(a); }
+						}
+					}
+					const applyPool = selIds => {
+						const before = list.length;
+						for (const dArr of dataPools) dArr.forEach(item => { if (selIds.has(String(idOf(item)))) pushItem(item); });
+						if (list.length > checkedCount + 1) {
+							// 命中的 id 池疑似非勾选集合（如全量 id 池），回滚本次合并，防"没勾也下载"式误下载
+							list.length = before;
+							seen.clear();
+							list.forEach(it => seen.add(String(idOf(it))));
+							return false;
+						}
+						return !!list.length;
+					};
+					// 三级顺序求交集：① 长度≤勾选数的 id 池 ② 行 data-row-key ∩ 对象池 ③ 与对象池有交集的其余 id 池兜底
+					for (const a of idPools.filter(a => a.length <= checkedCount + 1)) {
+						if (applyPool(new Set(a.map(String)))) break;
+					}
+					if (!list.length && rowIds.size) applyPool(rowIds);
+					if (!list.length) for (const a of idPools) {
+						const selIds = new Set(a.map(String));
+						if (dataPools.some(d => d.some(item => selIds.has(String(idOf(item)))))) { applyPool(selIds); break; }
+					}
+				}
+				if (list.length) console.info("[下载助手] 光鸭 getSelectedList 命中路径C");
+				else console.warn("[下载助手] 光鸭 getSelectedList 未命中，诊断:", {
+					mode: "none", checked: checkedCount, rowIds: rowIds.size,
+					roots: roots.length, dataPools: dataPools.length, idPools: idPools.length, steps
+				});
+				return list;
+			} catch (e) {
+				console.warn("[下载助手] 光鸭 getSelectedList 异常:", e);
 				return [];
 			}
 		},
